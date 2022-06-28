@@ -147,7 +147,16 @@ class RouteMatcher(object):
         captured = {}
         for route_url in self.route_urls:
             url_parts = route_url.split('/')
+
             if len(parts) == len(url_parts):
+                match=True
+                for idx, param in enumerate(url_parts):
+                    if param.startswith('{') and param.endswith('}'):
+                        continue
+                    if param != parts[idx]:
+                        match=False
+                if match is False:
+                    continue
                 for i, j in zip(parts, url_parts):
                     if j.startswith('{') and j.endswith('}'):
                         captured[j[1:-1]] = i
