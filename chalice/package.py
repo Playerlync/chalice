@@ -11,14 +11,15 @@ from typing import cast
 
 import yaml
 from yaml.scanner import ScannerError
-from yaml.nodes import Node, ScalarNode, SequenceNode
+from yaml.nodes import Node  # noqa
+from yaml.nodes import ScalarNode, SequenceNode, MappingNode
 
 from chalice.deploy.swagger import (
     CFNSwaggerGenerator, TerraformSwaggerGenerator)
 from chalice.utils import (
     OSUtils, UI, serialize_to_json, to_cfn_resource_name
 )
-from chalice.awsclient import TypedAWSClient # noqa
+from chalice.awsclient import TypedAWSClient  # noqa
 from chalice.config import Config  # noqa
 from chalice.deploy import models
 from chalice.deploy.appgraph import ApplicationGraphBuilder, DependencyBuilder
@@ -122,7 +123,6 @@ class ResourceBuilder(object):
 
 
 class TemplateGenerator(object):
-
     template_file = None  # type: str
 
     def __init__(self, config, options):
@@ -282,6 +282,21 @@ class SAMTemplateGenerator(TemplateGenerator):
             }  # type: Dict[str, Any]
             lambdafunction_definition['Properties'].update(layers_config)
 
+        if resource.log_group is not None:
+            num_days = resource.log_group.retention_in_days
+            log_name = self._register_cfn_resource_name(
+                resource.log_group.resource_name)
+            log_def = {
+                'Type': 'AWS::Logs::LogGroup',
+                'Properties': {
+                    'LogGroupName': {
+                        'Fn::Sub': '/aws/lambda/${%s}' % cfn_name
+                    },
+                    'RetentionInDays': num_days
+                }
+            }
+            resources[log_name] = log_def
+
         resources[cfn_name] = lambdafunction_definition
         self._add_iam_role(resource, resources[cfn_name])
 
@@ -299,6 +314,11 @@ class SAMTemplateGenerator(TemplateGenerator):
             # subclass of IAMRole.
             role = cast(models.PreCreatedIAMRole, role)
             cfn_resource['Properties']['Role'] = role.role_arn
+
+    def _generate_loggroup(self, resource, template):
+        # type: (models.LogGroup, Dict[str, Any]) -> None
+        # Handled in LambdaFunction generation
+        pass
 
     def _generate_restapi(self, resource, template):
         # type: (models.RestAPI, Dict[str, Any]) -> None
@@ -639,15 +659,20 @@ class SAMTemplateGenerator(TemplateGenerator):
                 'Fn::Sub': ('arn:${AWS::Partition}:sqs:${AWS::Region}'
                             ':${AWS::AccountId}:%s' % resource.queue)
             }
+        properties = {
+            'Queue': queue,
+            'BatchSize': resource.batch_size,
+            'MaximumBatchingWindowInSeconds':
+                resource.maximum_batching_window_in_seconds
+        }
+        if resource.maximum_concurrency:
+            properties["ScalingConfig"] = {
+                "MaximumConcurrency": resource.maximum_concurrency
+            }
         function_cfn['Properties']['Events'] = {
             sqs_cfn_name: {
                 'Type': 'SQS',
-                'Properties': {
-                    'Queue': queue,
-                    'BatchSize': resource.batch_size,
-                    'MaximumBatchingWindowInSeconds':
-                        resource.maximum_batching_window_in_seconds,
-                }
+                'Properties': properties
             }
         }
 
@@ -757,7 +782,7 @@ class SAMTemplateGenerator(TemplateGenerator):
                 {'CertificateArn': domain_name.certificate_arn,
                  'EndpointType': 'REGIONAL'},
             ]
-        }
+        }  # type: Dict[str, Any]
         if domain_name.tags:
             properties['Tags'] = domain_name.tags
         template['Resources'][cfn_name] = {
@@ -800,9 +825,9 @@ class TerraformGenerator(TemplateGenerator):
             'resource': {},
             'locals': {},
             'terraform': {
-                'required_version': '>= 0.12.26, < 1.2.0',
+                'required_version': '>= 0.12.26, < 1.4.0',
                 'required_providers': {
-                    'aws': {'version': '>= 2, < 4'},
+                    'aws': {'version': '>= 2, < 5'},
                     'null': {'version': '>= 2, < 4'}
                 }
             },
@@ -858,17 +883,202 @@ class TerraformGenerator(TemplateGenerator):
             'role': '${aws_iam_role.%s.id}' % resource.resource_name,
         }
 
+    def _add_websocket_lambda_integration(
+            self, websocket_api_id, websocket_handler, template):
+        # type: (str, str, Dict[str, Any]) -> None
+        websocket_handler_function_name = \
+            "${aws_lambda_function.%s.function_name}" % websocket_handler
+        resource_definition = {
+            'api_id': websocket_api_id,
+            'connection_type': 'INTERNET',
+            'content_handling_strategy': 'CONVERT_TO_TEXT',
+            'integration_type': 'AWS_PROXY',
+            'integration_uri': self._arnref(
+                "arn:%(partition)s:apigateway:%(region)s"
+                ":lambda:path/2015-03-31/functions/arn"
+                ":%(partition)s:lambda:%(region)s"
+                ":%(account_id)s:function"
+                ":%(websocket_handler_function_name)s/invocations",
+                websocket_handler_function_name=websocket_handler_function_name
+            )
+        }
+        template['resource'].setdefault(
+            'aws_apigatewayv2_integration', {}
+        )['%s_api_integration' % websocket_handler] = resource_definition
+
+    def _add_websocket_lambda_invoke_permission(
+            self, websocket_api_id, websocket_handler, template):
+        # type: (str, str, Dict[str, Any]) -> None
+        websocket_handler_function_name = \
+            "${aws_lambda_function.%s.function_name}" % websocket_handler
+        resource_definition = {
+            "function_name": websocket_handler_function_name,
+            "action": "lambda:InvokeFunction",
+            "principal": self._options.service_principal('apigateway'),
+            "source_arn": self._arnref(
+                "arn:%(partition)s:execute-api"
+                ":%(region)s:%(account_id)s"
+                ":%(websocket_api_id)s/*",
+                websocket_api_id=websocket_api_id
+            )
+        }
+        template['resource'].setdefault(
+            'aws_lambda_permission', {}
+        )['%s_invoke_permission' % websocket_handler] = resource_definition
+
+    def _add_websockets_route(self, websocket_api_id, route_key, template):
+        # type: (str, str, Dict[str, Any]) -> str
+        integration_target = {
+            '$connect': 'integrations/${aws_apigatewayv2_integration'
+                        '.websocket_connect_api_integration.id}',
+            '$disconnect': 'integrations/${aws_apigatewayv2_integration'
+                           '.websocket_disconnect_api_integration.id}',
+        }.get(route_key,
+              'integrations/${aws_apigatewayv2_integration'
+              '.websocket_message_api_integration.id}')
+
+        route_resource_name = {
+            '$connect': 'websocket_connect_route',
+            '$disconnect': 'websocket_disconnect_route',
+            '$default': 'websocket_message_route',
+        }.get(route_key, 'message')
+
+        template['resource'].setdefault(
+            'aws_apigatewayv2_route', {}
+        )[route_resource_name] = {
+            "api_id": websocket_api_id,
+            "route_key": route_key,
+            "target": integration_target
+        }
+        return route_resource_name
+
+    def _add_websocket_domain_name(self, websocket_api_id, resource, template):
+        # type: (str, models.WebsocketAPI, Dict[str, Any]) -> None
+        if resource.domain_name is None:
+            return
+        domain_name = resource.domain_name
+
+        ws_domain_name_definition = {
+            "domain_name": domain_name.domain_name,
+            "domain_name_configuration": {
+                'certificate_arn': domain_name.certificate_arn,
+                'endpoint_type': 'REGIONAL',
+            },
+        }
+
+        if domain_name.tags:
+            ws_domain_name_definition['tags'] = domain_name.tags
+
+        template['resource'].setdefault(
+            'aws_apigatewayv2_domain_name', {}
+        )[domain_name.resource_name] = ws_domain_name_definition
+
+        template['resource'].setdefault(
+            'aws_apigatewayv2_api_mapping', {}
+        )[domain_name.resource_name + '_mapping'] = {
+            "api_id": websocket_api_id,
+            "domain_name": "${aws_apigatewayv2_domain_name.%s.id}" %
+                           domain_name.resource_name,
+            "stage": "${aws_apigatewayv2_stage.websocket_api_stage.id}",
+        }
+
+    def _inject_websocketapi_outputs(self, websocket_api_id, template):
+        # type: (str, Dict[str, Any]) -> None
+        aws_lambda_functions = template['resource']['aws_lambda_function']
+        stage_name = \
+            template['resource']['aws_apigatewayv2_stage'][
+                'websocket_api_stage'][
+                'name']
+        output = template.setdefault('output', {})
+        output['WebsocketAPIId'] = {"value": websocket_api_id}
+
+        if 'websocket_connect' in aws_lambda_functions:
+            output['WebsocketConnectHandlerArn'] = {
+                "value": "${aws_lambda_function.websocket_connect.arn}"}
+            output['WebsocketConnectHandlerName'] = {
+                "value": (
+                    "${aws_lambda_function.websocket_connect.function_name}")}
+        if 'websocket_message' in aws_lambda_functions:
+            output['WebsocketMessageHandlerArn'] = {
+                "value": "${aws_lambda_function.websocket_message.arn}"}
+            output['WebsocketMessageHandlerName'] = {
+                "value": (
+                    "${aws_lambda_function.websocket_message.function_name}")}
+        if 'websocket_disconnect' in aws_lambda_functions:
+            output['WebsocketDisconnectHandlerArn'] = {
+                "value": "${aws_lambda_function.websocket_disconnect.arn}"}
+            output['WebsocketDisconnectHandlerName'] = {
+                "value": (
+                    "${aws_lambda_function.websocket_disconnect"
+                    ".function_name}")}
+
+        output['WebsocketConnectEndpointURL'] = {
+            "value": (
+                'wss://%(websocket_api_id)s.execute-api'
+                # The api_gateway_stage is filled in when
+                # the template is built.
+                '.${data.aws_region.chalice.name}'
+                '.amazonaws.com/%(stage_name)s/'
+            ) % {
+                "stage_name": stage_name,
+                "websocket_api_id": websocket_api_id
+            }
+        }
+
     def _generate_websocketapi(self, resource, template):
         # type: (models.WebsocketAPI, Dict[str, Any]) -> None
 
-        message = (
-            "Unable to package chalice apps that use experimental "
-            "Websocket decorators. Terraform AWS Provider "
-            "support for websocket is pending see "
-            "https://git.io/fj9X8 for details and progress. "
-            "You can deploy this app using `chalice deploy`."
-        )
-        raise NotImplementedError(message)
+        ws_definition = {
+            'name': resource.name,
+            'route_selection_expression': '$request.body.action',
+            'protocol_type': 'WEBSOCKET',
+        }
+
+        template['resource'].setdefault('aws_apigatewayv2_api', {})[
+            resource.resource_name] = ws_definition
+
+        websocket_api_id = "${aws_apigatewayv2_api.%s.id}" % \
+                           resource.resource_name
+
+        websocket_handlers = [
+            'websocket_connect',
+            'websocket_message',
+            'websocket_disconnect',
+        ]
+
+        for handler in websocket_handlers:
+            if handler in template['resource']['aws_lambda_function']:
+                self._add_websocket_lambda_integration(websocket_api_id,
+                                                       handler, template)
+                self._add_websocket_lambda_invoke_permission(websocket_api_id,
+                                                             handler, template)
+
+        route_resource_names = []
+        for route_key in resource.routes:
+            route_resource_name = self._add_websockets_route(websocket_api_id,
+                                                             route_key,
+                                                             template)
+            route_resource_names.append(route_resource_name)
+
+        template['resource'].setdefault(
+            'aws_apigatewayv2_deployment', {}
+        )['websocket_api_deployment'] = {
+            "api_id": websocket_api_id,
+            "depends_on": ["aws_apigatewayv2_route.%s" % name for name in
+                           route_resource_names]
+        }
+
+        template['resource'].setdefault(
+            'aws_apigatewayv2_stage', {}
+        )['websocket_api_stage'] = {
+            "api_id": websocket_api_id,
+            "deployment_id": ("${aws_apigatewayv2_deployment"
+                              ".websocket_api_deployment.id}"),
+            "name": resource.api_gateway_stage
+        }
+
+        self._add_websocket_domain_name(websocket_api_id, resource, template)
+        self._inject_websocketapi_outputs(websocket_api_id, template)
 
     def _generate_s3bucketnotification(self, resource, template):
         # type: (models.S3BucketNotification, Dict[str, Any]) -> None
@@ -918,14 +1128,20 @@ class TerraformGenerator(TemplateGenerator):
                 ":%(account_id)s:%(queue)s",
                 queue=resource.queue
             )
-        template['resource'].setdefault('aws_lambda_event_source_mapping', {})[
-            resource.resource_name] = {
+
+        aws_lambda_event_source_mapping = {
             'event_source_arn': event_source_arn,
             'batch_size': resource.batch_size,
             'maximum_batching_window_in_seconds':
                 resource.maximum_batching_window_in_seconds,
-            'function_name': self._fref(resource.lambda_function)
+            'function_name': self._fref(resource.lambda_function),
         }
+        if resource.maximum_concurrency:
+            aws_lambda_event_source_mapping["scaling_config"] = {
+                "maximum_concurrency": resource.maximum_concurrency
+            }
+        template['resource'].setdefault('aws_lambda_event_source_mapping', {})[
+            resource.resource_name] = aws_lambda_event_source_mapping
 
     def _generate_kinesiseventsource(self, resource, template):
         # type: (models.KinesisEventSource, Dict[str, Any]) -> None
@@ -1026,9 +1242,9 @@ class TerraformGenerator(TemplateGenerator):
         template['resource'].setdefault(
             "aws_lambda_layer_version", {})[
                 resource.resource_name] = {
-                'layer_name': resource.layer_name,
-                'compatible_runtimes': [resource.runtime],
-                'filename': resource.deployment_package.filename,
+                    'layer_name': resource.layer_name,
+                    'compatible_runtimes': [resource.runtime],
+                    'filename': resource.deployment_package.filename,
         }
         self._chalice_layer = resource.resource_name
 
@@ -1079,8 +1295,21 @@ class TerraformGenerator(TemplateGenerator):
             role = cast(models.PreCreatedIAMRole, resource.role)
             func_definition['role'] = role.role_arn
 
+        if resource.log_group is not None:
+            log_group = resource.log_group
+            num_days = log_group.retention_in_days
+            template['resource'].setdefault('aws_cloudwatch_log_group', {})[
+                log_group.resource_name] = {
+                    'name': log_group.resource_name,
+                    'retention_in_days': num_days,
+            }
         template['resource'].setdefault('aws_lambda_function', {})[
             resource.resource_name] = func_definition
+
+    def _generate_log_group(self, resource, remplate):
+        # type: (models.LogGroup, Dict[str, Any]) -> None
+        # Handled in LambdaFunction generation
+        pass
 
     def _generate_restapi(self, resource, template):
         # type: (models.RestAPI, Dict[str, Any]) -> None
@@ -1410,11 +1639,11 @@ class TemplateSerializer(object):
 
     def load_template(self, file_contents, filename=''):
         # type: (str, str) -> Dict[str, Any]
-        pass
+        raise NotImplementedError("load_template")
 
     def serialize_template(self, contents):
         # type: (Dict[str, Any]) -> str
-        pass
+        raise NotImplementedError("serialize_template")
 
 
 class JSONTemplateSerializer(TemplateSerializer):
@@ -1471,11 +1700,11 @@ class YAMLTemplateSerializer(TemplateSerializer):
         # type: (yaml.SafeLoader, Node) -> Any
         if node.tag[1:] == 'GetAtt' and isinstance(node.value,
                                                    six.string_types):
-            value = node.value.split('.', 1)
+            return node.value.split('.', 1)
         elif isinstance(node, ScalarNode):
-            value = loader.construct_scalar(node)
+            return loader.construct_scalar(node)
         elif isinstance(node, SequenceNode):
-            value = loader.construct_sequence(node)
-        else:
-            value = loader.construct_mapping(node)
-        return value
+            return loader.construct_sequence(node)
+        elif isinstance(node, MappingNode):
+            return loader.construct_mapping(node)
+        raise ValueError("Unknown YAML node: %s" % node)

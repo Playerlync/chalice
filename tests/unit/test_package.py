@@ -1,6 +1,6 @@
 import os
 import json
-import mock
+from unittest import mock
 
 import pytest
 from chalice.config import Config
@@ -449,6 +449,20 @@ class TestTerraformTemplate(TemplateTestBase):
         tf_resource = self.get_function(template)
         assert tf_resource['reserved_concurrent_executions'] == 5
 
+    def test_adds_log_group_resource_when_configured(self, sample_app):
+        function = self.lambda_function()
+        name = function.resource_name + '-log-group'
+        function.log_group = models.LogGroup(
+            resource_name=name,
+            log_group_name='/aws/lambda/%s' % function.function_name,
+            retention_in_days=7)
+        template = self.template_gen.generate([function])
+        log_resource = template['resource']['aws_cloudwatch_log_group'][name]
+        assert log_resource == {
+            'name': name,
+            'retention_in_days': 7,
+        }
+
     def test_can_add_tracing_config(self, sample_app):
         function = self.lambda_function()
         function.xray = True
@@ -732,6 +746,34 @@ class TestTerraformTemplate(TemplateTestBase):
                    'maximum_batching_window_in_seconds': 0
         }
 
+    def test_can_package_sqs_handler_with_max_concurrency(self, sample_app):
+        @sample_app.on_sqs_message(
+            queue='foo',
+            batch_size=5,
+            maximum_concurrency=2
+        )
+        def handler(event):
+            pass
+
+        config = Config.create(chalice_app=sample_app,
+                               project_dir='.',
+                               app_name='sample_app',
+                               api_gateway_stage='api')
+        template = self.generate_template(config)
+
+        assert template['resource'][
+                   'aws_lambda_event_source_mapping'][
+                   'handler-sqs-event-source'] == {
+                   'event_source_arn': (
+                       'arn:${data.aws_partition.chalice.partition}:sqs'
+                       ':${data.aws_region.chalice.name}:'
+                       '${data.aws_caller_identity.chalice.account_id}:foo'),
+                   'function_name': '${aws_lambda_function.handler.arn}',
+                   'batch_size': 5,
+                   'maximum_batching_window_in_seconds': 0,
+                   'scaling_config': {'maximum_concurrency': 2}
+        }
+
     def test_sqs_arn_does_not_use_fn_sub(self, sample_app):
         @sample_app.on_sqs_message(queue_arn='arn:foo:bar', batch_size=5)
         def handler(event):
@@ -801,18 +843,177 @@ class TestTerraformTemplate(TemplateTestBase):
                        'maximum_batching_window_in_seconds': 0
                    }
 
-    def test_package_websocket_with_error_message(self, sample_websocket_app):
+    def test_can_generate_websockets_api(self, sample_websocket_app):
         config = Config.create(chalice_app=sample_websocket_app,
                                project_dir='.',
                                app_name='sample_app',
                                api_gateway_stage='api')
-        with pytest.raises(NotImplementedError) as excinfo:
-            self.generate_template(config)
+        template = self.generate_template(config)
 
-        # Should mention the decorator name.
-        assert 'Websocket decorators' in str(excinfo.value)
-        # Should mention you can use `chalice deploy`.
-        assert 'chalice deploy' in str(excinfo.value)
+        assert template['output'] == {
+            'WebsocketAPIId': {
+                'value': '${aws_apigatewayv2_api.websocket_api.id}'
+            },
+            'WebsocketConnectHandlerArn': {
+                'value': '${aws_lambda_function.websocket_connect.arn}'
+            },
+            'WebsocketConnectHandlerName': {
+                'value': (
+                    '${aws_lambda_function.websocket_connect.function_name}')
+            },
+            'WebsocketMessageHandlerArn': {
+                'value': '${aws_lambda_function.websocket_message.arn}'
+            },
+            'WebsocketMessageHandlerName': {
+                'value': (
+                    '${aws_lambda_function.websocket_message.function_name}')
+            },
+            'WebsocketDisconnectHandlerArn': {
+                'value': '${aws_lambda_function.websocket_disconnect.arn}'
+            },
+            'WebsocketDisconnectHandlerName': {
+                'value': (
+                    '${aws_lambda_function.websocket_disconnect'
+                    '.function_name}')
+            },
+            'WebsocketConnectEndpointURL': {
+                'value': 'wss://${aws_apigatewayv2_api.websocket_api.id}'
+                         '.execute-api.${data.aws_region.chalice.name}'
+                         '.amazonaws.com/api/'
+            }
+        }
+
+        assert template['resource']['aws_apigatewayv2_api'] == {
+            'websocket_api': {
+                'name': 'sample_app-dev-websocket-api',
+                'route_selection_expression': '$request.body.action',
+                'protocol_type': 'WEBSOCKET'
+            }
+        }
+
+        assert template['resource']['aws_apigatewayv2_integration'] == {
+            'websocket_connect_api_integration': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'connection_type': 'INTERNET',
+                'content_handling_strategy': 'CONVERT_TO_TEXT',
+                'integration_type': 'AWS_PROXY',
+                'integration_uri': 'arn:${data.aws_partition.chalice'
+                                   '.partition}:apigateway:'
+                                   '${data.aws_region.chalice.name}'
+                                   ':lambda:path/2015-03-31/functions/arn'
+                                   ':${data.aws_partition.chalice.partition}'
+                                   ':lambda:${data.aws_region.chalice.name}'
+                                   ':${data.aws_caller_identity'
+                                   '.chalice.account_id}:function'
+                                   ':${aws_lambda_function.websocket_connect'
+                                   '.function_name}/invocations'
+            },
+            'websocket_message_api_integration': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'connection_type': 'INTERNET',
+                'content_handling_strategy': 'CONVERT_TO_TEXT',
+                'integration_type': 'AWS_PROXY',
+                'integration_uri': 'arn:${data.aws_partition.chalice'
+                                   '.partition}:apigateway'
+                                   ':${data.aws_region.chalice.name}'
+                                   ':lambda:path/2015-03-31/functions/arn'
+                                   ':${data.aws_partition.chalice.partition}'
+                                   ':lambda:${data.aws_region.chalice.name}'
+                                   ':${data.aws_caller_identity.chalice'
+                                   '.account_id}:function'
+                                   ':${aws_lambda_function.websocket_message'
+                                   '.function_name}/invocations'
+            },
+            'websocket_disconnect_api_integration': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'connection_type': 'INTERNET',
+                'content_handling_strategy': 'CONVERT_TO_TEXT',
+                'integration_type': 'AWS_PROXY',
+                'integration_uri': 'arn:${data.aws_partition'
+                                   '.chalice.partition}:apigateway'
+                                   ':${data.aws_region.chalice.name}'
+                                   ':lambda:path/2015-03-31/functions/arn'
+                                   ':${data.aws_partition.chalice.partition}'
+                                   ':lambda:${data.aws_region.chalice.name}'
+                                   ':${data.aws_caller_identity'
+                                   '.chalice.account_id}:function'
+                                   ':${aws_lambda_function'
+                                   '.websocket_disconnect.function_name}'
+                                   '/invocations'
+            }
+        }
+
+        assert template['resource']['aws_lambda_permission'] == {
+            'websocket_connect_invoke_permission': {
+                'function_name': '${aws_lambda_function.websocket_connect'
+                                 '.function_name}',
+                'action': 'lambda:InvokeFunction',
+                'principal': 'apigateway.amazonaws.com',
+                'source_arn': 'arn:${data.aws_partition.chalice.partition}'
+                              ':execute-api:${data.aws_region.chalice.name}'
+                              ':${data.aws_caller_identity.chalice.account_id}'
+                              ':${aws_apigatewayv2_api.websocket_api.id}/*'
+            },
+            'websocket_message_invoke_permission': {
+                'function_name': '${aws_lambda_function.websocket_message'
+                                 '.function_name}',
+                'action': 'lambda:InvokeFunction',
+                'principal': 'apigateway.amazonaws.com',
+                'source_arn': 'arn:${data.aws_partition.chalice.partition}'
+                              ':execute-api:${data.aws_region.chalice.name}'
+                              ':${data.aws_caller_identity.chalice.account_id}'
+                              ':${aws_apigatewayv2_api.websocket_api.id}/*'
+            },
+            'websocket_disconnect_invoke_permission': {
+                'function_name': '${aws_lambda_function.websocket_disconnect'
+                                 '.function_name}',
+                'action': 'lambda:InvokeFunction',
+                'principal': 'apigateway.amazonaws.com',
+                'source_arn': 'arn:${data.aws_partition.chalice.partition}'
+                              ':execute-api:${data.aws_region.chalice.name}'
+                              ':${data.aws_caller_identity.chalice.account_id}'
+                              ':${aws_apigatewayv2_api.websocket_api.id}/*'
+            }
+        }
+
+        assert template['resource']['aws_apigatewayv2_route'] == {
+            'websocket_connect_route': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'route_key': '$connect',
+                'target': 'integrations/${aws_apigatewayv2_integration'
+                          '.websocket_connect_api_integration.id}'
+            },
+            'websocket_message_route': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'route_key': '$default',
+                'target': 'integrations/${aws_apigatewayv2_integration'
+                          '.websocket_message_api_integration.id}'
+            },
+            'websocket_disconnect_route': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'route_key': '$disconnect',
+                'target': 'integrations/${aws_apigatewayv2_integration'
+                          '.websocket_disconnect_api_integration.id}'
+            }
+        }
+
+        assert template['resource']['aws_apigatewayv2_deployment'] == {
+            'websocket_api_deployment': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'depends_on': [
+                    'aws_apigatewayv2_route.websocket_connect_route',
+                    'aws_apigatewayv2_route.websocket_message_route',
+                    'aws_apigatewayv2_route.websocket_disconnect_route'
+                ]}}
+
+        assert template['resource']['aws_apigatewayv2_stage'] == {
+            'websocket_api_stage': {
+                'api_id': '${aws_apigatewayv2_api.websocket_api.id}',
+                'deployment_id': '${aws_apigatewayv2_deployment'
+                                 '.websocket_api_deployment.id}',
+                'name': 'api'
+            }
+        }
 
     def test_can_generate_custom_domain_name(self, sample_app):
         config = Config.create(
@@ -1042,6 +1243,22 @@ class TestSAMTemplate(TemplateTestBase):
         template = self.template_gen.generate([function])
         cfn_resource = list(template['Resources'].values())[0]
         assert cfn_resource['Properties']['ReservedConcurrentExecutions'] == 5
+
+    def test_adds_log_group_resource_when_configured(self, sample_app):
+        function = self.lambda_function()
+        function.log_group = models.LogGroup(
+            resource_name=function.resource_name + '-log-group',
+            log_group_name='/aws/lambda/%s' % function.function_name,
+            retention_in_days=7)
+        template = self.template_gen.generate([function])
+        log_resource = template['Resources']['FooLogGroup']
+        assert log_resource == {
+            'Type': 'AWS::Logs::LogGroup',
+            'Properties': {
+                'LogGroupName': {'Fn::Sub': '/aws/lambda/${Foo}'},
+                'RetentionInDays': 7
+            }
+        }
 
     def test_adds_layers_when_provided(self, sample_app):
         function = self.lambda_function()
@@ -1543,6 +1760,37 @@ class TestSAMTemplate(TemplateTestBase):
                     },
                     'BatchSize': 5,
                     'MaximumBatchingWindowInSeconds': 0,
+                },
+            }
+        }
+
+    def test_can_package_sqs_handler_with_max_concurrency(self, sample_app):
+        @sample_app.on_sqs_message(
+            queue='foo',
+            batch_size=5,
+            maximum_concurrency=2
+        )
+        def handler(event):
+            pass
+
+        config = Config.create(chalice_app=sample_app,
+                               project_dir='.',
+                               api_gateway_stage='api')
+        template = self.generate_template(config)
+        sns_handler = template['Resources']['Handler']
+        assert sns_handler['Properties']['Events'] == {
+            'HandlerSqsEventSource': {
+                'Type': 'SQS',
+                'Properties': {
+                    'Queue': {
+                        'Fn::Sub': (
+                            'arn:${AWS::Partition}:sqs:${AWS::Region}'
+                            ':${AWS::AccountId}:foo'
+                        )
+                    },
+                    'BatchSize': 5,
+                    'MaximumBatchingWindowInSeconds': 0,
+                    'ScalingConfig': {'MaximumConcurrency': 2}
                 },
             }
         }
